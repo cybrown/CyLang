@@ -1,0 +1,2 @@
+cp cyexec /usr/local/bin/
+chown root:root /usr/local/bin/cyexec

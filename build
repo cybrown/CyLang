@@ -1,0 +1,66 @@
+#! /bin/sh
+if [ "$1" = "-a" ]
+then
+    build_all=0
+else
+    build_all=1
+fi
+mkdir tmp
+for f in type misc symtab expr stm visitor
+do
+    echo Building module $f
+    cd $f
+    ls *.cpp | while read source
+    do
+        #echo "    Building $source"
+        if [ "$build_all" = "0" -o \( ! -f ${source%.cpp}.o -o ! ${source%.cpp}.o -nt $source \) ]
+        then
+            g++ -W -Wall -pedantic -g -iquote../include/cyvm -c $source
+            if [ ! $? ]
+            then
+                echo "    Error building $source"
+            fi
+        fi
+    done
+    cp *.o ../tmp
+    cd ..
+done
+
+
+echo Building module llvm
+cd llvm
+ls *.cpp | while read source
+do
+    #echo "    Building $source"
+    if [ "$build_all" = "0" -o \( ! -f ${source%.cpp}.o -o ! ${source%.cpp}.o -nt $source \) ]
+    then
+        # llvm needs long long
+        g++ -Wno-long-long -W -Wall -pedantic -g -c $source -iquote../include/cyvm `llvm-config --cppflags --ldflags --libs core` -ldl
+        if [ ! $? ]
+        then
+            echo "    Error building $source"
+        fi
+    fi
+done
+cp *.o ../tmp
+cd ..
+
+# Create static library
+cd tmp
+echo Create static lib
+ar rcs libcyvm.a *.o
+mv *.a ../lib
+rm *.o
+cd ..
+rmdir tmp
+
+echo Building lexer and parser
+bison -d parser.ypp -o parser.cpp -v
+flex -t lexer.lex > lexer.cpp
+echo Compiling compiler
+gcc -c runtime.c -o runtime.o
+ar rcs libcyrt.a runtime.o
+mv libcyrt.a lib/
+# No pedantic because of function pointer cast
+g++ -Wno-long-long -W -Wall -g -iquote./include/boehmgc lexer.cpp parser.cpp -L./lib -lgc -lcyvm -iquote./include/cyvm `llvm-config --cppflags --ldflags --libs core jit native` -ldl -lfl -lcyrt -o cyexec
+#g++ -Wno-long-long -W -Wall -g -iquote./include/boehmgc bacasable.cpp -L./lib -lgc -lcyvm -iquote./include/cyvm `llvm-config --cppflags --ldflags --libs core jit native` -ldl -lfl -lcyrt -o bac

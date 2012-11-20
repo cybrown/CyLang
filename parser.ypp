@@ -1,0 +1,862 @@
+%{
+#include <stdio.h>
+#include <stdlib.h>
+#include <vector>
+#include <string>
+#include <iostream>
+#include <typeinfo>
+
+#include <fstream>
+
+#include <set>
+
+#include "AllNodes.hpp"
+#include "AllTypes.hpp"
+#include "VisitorNodeDisplay.hpp"
+#include "VisitorNodeSimplify.hpp"
+#include "VisitorNodeTyper.hpp"
+#include "VisitorNodeLlvm.hpp"
+#include "Symtab.hpp"
+#include "Argument.hpp"
+
+#include "Class.hpp"
+#include "Interface.hpp"
+
+#include "runtime.hpp"
+
+#include <llvm/Support/raw_os_ostream.h>
+
+extern std::set<std::string> type_identifiers;
+
+#pragma GCC diagnostic ignored "-Wwrite-strings"
+extern "C" {
+    int yylex(void);
+}
+extern int current_line;
+extern int current_char;
+extern FILE *out_debug;
+void yyerror(char *s, ...)
+{
+    fprintf(stderr, "Parse ERROR line %d (%d): %s\n", current_line, current_char, s);
+}
+VisitorNodeDisplay* display_visitor;
+VisitorNodeTyper* typer_visitor;
+VisitorNodeSimplify* simplify_visitor;
+VisitorNodeLlvm* llvm_visitor;
+
+StmBlock* main_block;
+StmDecl* main_func;
+
+Class* last_class = 0;
+Interface* last_interface = 0;
+
+void process_stm(Stm* stm) {
+    main_block->addStatement(stm);
+}
+
+// Class
+std::map<std::string, Class*> class_container;
+std::map<std::string, Interface*> interface_container;
+
+/* Size of default input buffer. */
+#ifndef YY_BUF_SIZE
+#ifdef __ia64__
+/* On IA-64, the buffer size is 16k, not 8k.
+ * Moreover, YY_BUF_SIZE is 2*YY_READ_BUF_SIZE in the general case.
+ * Ditto for the __ia64__ case accordingly.
+ */
+#define YY_BUF_SIZE 32768
+#else
+#define YY_BUF_SIZE 16384
+#endif /* __ia64__ */
+#endif
+typedef struct yy_buffer_state *YY_BUFFER_STATE;
+
+YY_BUFFER_STATE yy_create_buffer (FILE *file,int size  );
+void yy_switch_to_buffer (YY_BUFFER_STATE new_buffer  );
+void yypush_buffer_state (YY_BUFFER_STATE new_buffer  );
+
+std::vector<std::string>* include_path;
+std::set<std::string>*    included;
+
+FILE* open_from_path(std::string file_name, std::vector<std::string>* path) {
+    std::vector<std::string>::iterator it;
+    FILE* fp = 0;
+    for (it = path->begin(); it != path->end(); it++)
+    {
+        fp = fopen(((*it) + file_name).c_str(), "r");
+        // Get realpath of file, if already included, return null;
+        if (fp)
+        {
+            if (included->find(realpath(((*it) + file_name).c_str(), 0)) != included->end())
+            {
+                return 0;
+            }
+            included->insert(realpath(((*it) + file_name).c_str(), 0));
+            break;
+        }
+    }
+    return fp;
+}
+
+FILE* file_to_parse;
+void set_file_to_parse(FILE* file) {
+    // TODO Write somewhere in which file we are for error messages
+    YY_BUFFER_STATE new_buf = yy_create_buffer(file, YY_BUF_SIZE);
+    yypush_buffer_state(new_buf);
+    yy_switch_to_buffer(new_buf);
+}
+
+struct s_class_attr {
+    char* name;
+    Type* type;
+    std::vector<Argument*>* args;
+    Stm* body;
+    int method_state;       // 0: normal, 1: static, 2: virtual
+};
+
+%}
+
+%token <str> LITERAL_CHAR
+%token <str> LITERAL_BYTE
+%token <str> LITERAL_SHORT
+%token <str> LITERAL_INTEGER
+%token <str> LITERAL_LONG
+
+%token <str> LITERAL_FLOAT
+%token <str> LITERAL_DOUBLE
+%token <str> LITERAL_STRING
+
+%token <str> LITERAL_ASSEMBLY
+
+%token <str> TOK_IDENTIFIER
+%token <str> TOK_TYPE_IDENTIFIER
+
+%token <str> TOK_IF
+%token <str> TOK_ELSE
+%token <str> TOK_SWITCH
+%token <str> TOK_CASE
+%token <str> TOK_WHILE
+%token <str> TOK_DO
+%token <str> TOK_FOR
+%token <str> TOK_BREAK
+%token <str> TOK_CONTINUE
+%token <str> TOK_DEFAULT
+
+%token <str> TOK_IMPORT
+%token <str> TOK_EXTERN
+%token <str> TOK_VIRTUAL
+%token <str> TOK_OVERRIDE
+%token <str> TOK_STATIC
+%token <str> TOK_EXTENDS
+%token <str> TOK_IMPLEMENTS
+
+%token <str> TOK_VAR
+%token <str> TOK_CLASS
+%token <str> TOK_INTERFACE
+
+%token <str> TOK_BOOL
+%token <str> TOK_CHAR
+%token <str> TOK_BYTE
+%token <str> TOK_SHORT
+%token <str> TOK_INT
+%token <str> TOK_LONG
+%token <str> TOK_FLOAT
+%token <str> TOK_DOUBLE
+%token <str> TOK_STRING
+%token <str> TOK_VOID
+
+%token <str> TOK_TRUE
+%token <str> TOK_FALSE
+
+%token <str> TOK_RETURN
+
+%token <str> TOK_ASSIGN
+
+%token <str> TOK_ADD_ASSIGN
+%token <str> TOK_SUB_ASSIGN
+%token <str> TOK_MUL_ASSIGN
+%token <str> TOK_DIV_ASSIGN
+%token <str> TOK_MOD_ASSIGN
+%token <str> TOK_B_AND_ASSIGN
+%token <str> TOK_B_OR_ASSIGN
+%token <str> TOK_B_XOR_ASSIGN
+%token <str> TOK_SHL_ASSIGN
+%token <str> TOK_SHR_ASSIGN
+%token <str> TOK_ASHR_ASSIGN
+
+%token <str> TOK_INC
+%token <str> TOK_DEC
+
+%token <str> TOK_EQ
+%token <str> TOK_NEQ
+%token <str> TOK_LT
+%token <str> TOK_LTE
+%token <str> TOK_GT
+%token <str> TOK_GTE
+
+%token <str> TOK_AND
+%token <str> TOK_OR
+
+%token <str> TOK_SHL
+%token <str> TOK_SHR
+%token <str> TOK_ASHR
+
+%union {
+    int                      num;
+    char*                    str;
+    Expr*                    expr;
+    Stm*                     stm;
+    StmBlock*                block;
+    std::vector<Argument*>*  argdeflst;
+    Type*                    type;
+    StmDecl*                 decl;
+    StmSwitch*               stm_switch;
+    ExprCall*                arglst;
+    ExprArray*               array;
+    Class*                   class_obj;
+    Interface*               interface_obj;
+    s_class_attr             class_attr;
+};
+
+%nonassoc IFX
+%nonassoc TOK_ELSE
+
+%type <expr> expression
+%type <expr> expr_primary
+%type <expr> expr_postfix
+%type <expr> expr_unary
+%type <expr> expr_mul
+%type <expr> expr_add
+%type <expr> expr_shift
+%type <expr> expr_comparison
+%type <expr> expr_equal
+%type <expr> expr_bitwise_and
+%type <expr> expr_bitwise_xor
+%type <expr> expr_bitwise_or
+%type <expr> expr_logical_and
+%type <expr> expr_logical_or
+%type <expr> expr_conditional
+%type <expr> expr_assign
+
+%type <array> array_list
+%type <array> allocate_array
+%type <array> literal_array
+
+%type <stm> statement
+%type <stm> stm_import
+%type <stm> stm_expr
+%type <stm> stm_if
+%type <stm> stm_while
+%type <stm> stm_do
+%type <stm> stm_for
+%type <stm> stm_block
+%type <stm> stm_switch
+%type <stm> stm_return
+%type <stm> stm_break
+%type <stm> stm_continue
+%type <stm_switch> list_cases
+%type <stm> error
+%type <stm> declaration
+%type <block> stm_list
+%type <type> type_specifier
+%type <type> type_primary
+%type <argdeflst> argument_definition_list
+%type <arglst> argument_list
+
+%type <stm> class_declaration
+%type <str> class_identifier
+%type <class_obj> class_element_list
+%type <class_attr> class_element
+
+%type <stm> interface_declaration
+%type <str> interface_identifier
+%type <interface_obj> interface_element_list
+%type <class_attr> interface_element
+
+%%
+
+program
+    : program statement     {process_stm($2);};
+    | statement             {process_stm($1);};
+    ;
+
+stm_if
+    : TOK_IF '(' expression ')' statement %prec IFX          {$$ = new StmIf($3, $5, 0);}
+    | TOK_IF '(' expression ')' statement TOK_ELSE statement {$$ = new StmIf($3, $5, $7);}
+    
+stm_while
+    : TOK_WHILE '(' expression ')' statement    {$$ = new StmWhile($3, $5);}
+    ;
+    
+stm_do
+    : TOK_DO statement TOK_WHILE '(' expression ')' ';'    {$$ = new StmDo($5, $2);}
+    ;
+    
+stm_for
+    : TOK_FOR '(' expression ';' expression ';' expression ')' statement    {$$ = new StmFor($3, $5, $7, $9);}
+    ;
+
+stm_block
+    : '{' stm_list '}'  {$$ = $2;}
+    | '{' '}'           {$$ = new StmBlock();}
+    ;
+
+stm_list
+    : statement                 {$$ = new StmBlock($1);}
+    | stm_list statement        {$1->addStatement($2);}
+    ;
+
+stm_expr
+    : ';'               {$$ = new StmNop();}
+    | expression ';'    {$$ = new StmExpr($1);}
+    ;
+
+stm_switch
+    : TOK_SWITCH '(' expression ')' '{' list_cases '}'          {$6->setCondition($3);; $$ = $6;}
+    ;
+
+list_cases
+    : TOK_CASE LITERAL_BYTE ':' stm_list                     {$$ = new StmSwitch(); $$->addCase(atol($2), $4);}
+    | TOK_CASE LITERAL_SHORT ':' stm_list                    {$$ = new StmSwitch(); $$->addCase(atol($2), $4);}
+    | TOK_CASE LITERAL_INTEGER ':' stm_list                  {$$ = new StmSwitch(); $$->addCase(atol($2), $4);}
+    | TOK_CASE LITERAL_LONG ':' stm_list                     {$$ = new StmSwitch(); $$->addCase(atol($2), $4);}
+
+    | TOK_DEFAULT ':' stm_list                               {$$ = new StmSwitch(); $$->setDefault($3);}
+
+    | list_cases TOK_CASE LITERAL_BYTE ':' stm_list          {$1->addCase(atol($3), $5); $$ = $1;}
+    | list_cases TOK_CASE LITERAL_SHORT ':' stm_list         {$1->addCase(atol($3), $5); $$ = $1;}
+    | list_cases TOK_CASE LITERAL_INTEGER ':' stm_list       {$1->addCase(atol($3), $5); $$ = $1;}
+    | list_cases TOK_CASE LITERAL_LONG ':' stm_list          {$1->addCase(atol($3), $5); $$ = $1;}
+
+    | list_cases TOK_DEFAULT ':' stm_list                    {$1->setDefault($4); $$ = $1;}
+    ;
+    
+stm_return
+    : TOK_RETURN expression ';'     {$$ = new StmReturn($2);}
+    | TOK_RETURN ';'                {$$ = new StmReturn(0);}
+    ;
+    
+stm_break
+    : TOK_BREAK ';'                {$$ = new StmBreak();}
+    ;
+    
+stm_continue
+    : TOK_CONTINUE ';'                {$$ = new StmContinue();}
+    ;
+
+stm_import
+    : TOK_IMPORT TOK_IDENTIFIER ';'         {
+                                                std::string file_name = $2;
+                                                file_name += ".cy";
+                                                $$ = new StmNop(); // Give parser a dummy node
+                                                FILE* fp = open_from_path(file_name, include_path);
+                                                if (fp)
+                                                {
+                                                    set_file_to_parse(fp);
+                                                }
+                                            }
+    ;
+
+statement
+    : stm_expr
+    | stm_import
+    | stm_block
+    | stm_if
+    | stm_do
+    | stm_for
+    | stm_while
+    | stm_switch
+    | stm_return
+    | stm_break
+    | stm_continue
+    | declaration
+    ;
+
+declaration
+    : type_specifier TOK_IDENTIFIER TOK_ASSIGN expression ';'                        {$$ = new StmDecl($1, $2, $4);}
+    | TOK_VAR TOK_IDENTIFIER TOK_ASSIGN expression ';'                               {$$ = new StmDecl(0, $2, $4);}
+    | type_specifier TOK_IDENTIFIER ';'                                              {$$ = new StmDecl($1, $2, 0);}
+    | type_specifier TOK_IDENTIFIER '(' ')' stm_block                                {$$ = new StmDecl($1, $2, 0, $5);}
+    | type_specifier TOK_IDENTIFIER '(' TOK_VOID ')' stm_block                       {$$ = new StmDecl($1, $2, 0, $6);}
+    | type_specifier TOK_IDENTIFIER '(' argument_definition_list ')' stm_block       {$$ = new StmDecl($1, $2, $4, $6);}
+    | type_specifier TOK_IDENTIFIER '(' ')' ';'                                      {$$ = new StmDecl($1, $2, 0, 0);}
+    | type_specifier TOK_IDENTIFIER '(' TOK_VOID ')' ';'                             {$$ = new StmDecl($1, $2, 0, 0);}
+    | type_specifier TOK_IDENTIFIER '(' argument_definition_list ')' ';'             {$$ = new StmDecl($1, $2, $4, 0);}
+    | type_specifier TOK_EXTERN TOK_IDENTIFIER '(' ')' ';'                           {$$ = new StmDecl($1, $3, 0, 0, true);}
+    | type_specifier TOK_EXTERN TOK_IDENTIFIER '(' TOK_VOID ')' ';'                  {$$ = new StmDecl($1, $3, 0, 0, true);}
+    | type_specifier TOK_EXTERN TOK_IDENTIFIER '(' argument_definition_list ')' ';'  {$$ = new StmDecl($1, $3, $5, 0, true);}
+    | class_declaration
+    | interface_declaration
+    ;
+
+interface_declaration
+    : TOK_INTERFACE interface_identifier '{' interface_element_list '}'     {$$ = new StmInterface(last_interface); last_interface = 0;}
+    ;
+
+interface_identifier
+    : TOK_IDENTIFIER            {
+                                    type_identifiers.insert($1);
+                                    last_interface = new Interface();
+                                    last_interface->setName($1);
+                                    interface_container[$1] = last_interface;
+                                }
+    ;
+
+interface_element_list
+    : interface_element                         {$$ = last_interface; $$->addMethod($1.name, $1.type, $1.args);}
+    | interface_element_list interface_element  {$$->addMethod($2.name, $2.type, $2.args);}
+    ;
+
+interface_element
+    : type_specifier TOK_IDENTIFIER '(' ')' ';'                             {$$.type = $1; $$.name = $2; $$.args = 0; $$.body = 0; $$.method_state = 0;}
+    | type_specifier TOK_IDENTIFIER '(' argument_definition_list ')' ';'    {$$.type = $1; $$.name = $2; $$.args = $4; $$.body = 0; $$.method_state = 0;}
+    ;
+
+
+class_declaration
+    : TOK_CLASS class_identifier '{' class_element_list '}'   {$$ = new StmClass(last_class); last_class = 0;}
+    ;
+
+class_identifier
+    : TOK_IDENTIFIER    {
+                            type_identifiers.insert($1);
+                            last_class = new Class();
+                            last_class->setName($1);
+                            class_container[$1] = last_class;
+                        }
+    | TOK_IDENTIFIER TOK_EXTENDS TOK_TYPE_IDENTIFIER    {
+                                                            type_identifiers.insert($1);
+                                                            last_class = new Class();
+                                                            last_class->setName($1);
+                                                            class_container[$1] = last_class;
+                                                            last_class->extends(class_container[$3]);
+                                                        }
+    | TOK_IDENTIFIER TOK_IMPLEMENTS TOK_TYPE_IDENTIFIER {
+                                                            type_identifiers.insert($1);
+                                                            last_class = new Class();
+                                                            last_class->setName($1);
+                                                            class_container[$1] = last_class;
+                                                            last_class->implements(interface_container[$3]);
+                                                        }
+    ;
+
+class_element_list
+    : class_element                        {$$ = last_class; $$->addMember($1.name, $1.type, $1.args, $1.body, $1.method_state);}
+    | class_element_list class_element     {$$->addMember($2.name, $2.type, $2.args, $2.body, $2.method_state);}
+    ;
+
+class_element
+    : type_specifier TOK_IDENTIFIER ';'                                                    {$$.type = $1; $$.name = $2; $$.args = 0; $$.body = 0; $$.method_state = 0;}
+    | type_specifier TOK_IDENTIFIER '(' ')' stm_block                                      {$$.type = $1; $$.name = $2; $$.args = 0; $$.body = $5; $$.method_state = 0;}
+    | type_specifier TOK_IDENTIFIER '(' TOK_VOID ')' stm_block                             {$$.type = $1; $$.name = $2; $$.args = 0; $$.body = $6; $$.method_state = 0;}
+    | type_specifier TOK_IDENTIFIER '(' argument_definition_list ')' stm_block             {$$.type = $1; $$.name = $2; $$.args = $4; $$.body = $6; $$.method_state = 0;}
+    | TOK_VIRTUAL type_specifier TOK_IDENTIFIER '(' ')' stm_block                          {$$.type = $2; $$.name = $3; $$.args = 0; $$.body = $6; $$.method_state = 2;}
+    | TOK_VIRTUAL type_specifier TOK_IDENTIFIER '(' TOK_VOID ')' stm_block                 {$$.type = $2; $$.name = $3; $$.args = 0; $$.body = $7; $$.method_state = 2;}
+    | TOK_VIRTUAL type_specifier TOK_IDENTIFIER '(' argument_definition_list ')' stm_block {$$.type = $2; $$.name = $3; $$.args = $5; $$.body = $7; $$.method_state = 2;}
+    | TOK_OVERRIDE type_specifier TOK_IDENTIFIER '(' ')' stm_block                          {$$.type = $2; $$.name = $3; $$.args = 0; $$.body = $6; $$.method_state = 3;}
+    | TOK_OVERRIDE type_specifier TOK_IDENTIFIER '(' TOK_VOID ')' stm_block                 {$$.type = $2; $$.name = $3; $$.args = 0; $$.body = $7; $$.method_state = 3;}
+    | TOK_OVERRIDE type_specifier TOK_IDENTIFIER '(' argument_definition_list ')' stm_block {$$.type = $2; $$.name = $3; $$.args = $5; $$.body = $7; $$.method_state = 3;}
+    | TOK_STATIC type_specifier TOK_IDENTIFIER '(' ')' stm_block                           {$$.type = $2; $$.name = $3; $$.args = 0; $$.body = $6; $$.method_state = 1;}
+    | TOK_STATIC type_specifier TOK_IDENTIFIER '(' TOK_VOID ')' stm_block                  {$$.type = $2; $$.name = $3; $$.args = 0; $$.body = $7; $$.method_state = 1;}
+    | TOK_STATIC type_specifier TOK_IDENTIFIER '(' argument_definition_list ')' stm_block  {$$.type = $2; $$.name = $3; $$.args = $5; $$.body = $7; $$.method_state = 1;}
+    ;
+
+argument_definition_list
+    : type_specifier TOK_IDENTIFIER                                {$$ = new std::vector<Argument*>(); $$->push_back(new Argument($1, $2));}
+    | argument_definition_list ',' type_specifier TOK_IDENTIFIER   {$1->push_back(new Argument($3, $4)); $$ = $1;}
+    ;
+
+type_specifier
+    : type_primary
+    | TOK_TYPE_IDENTIFIER                         {$$ = new TypeClass(class_container[$1]);}
+    | type_specifier '[' ']'                      {$$ = new TypeArray($1);}
+    | type_specifier '[' LITERAL_INTEGER ']'      {$$ = new TypeArray($1, atoi($3));}
+    | TOK_VOID                                    {$$ = TypePrimary::getVoid();}
+    ;
+
+type_primary
+    : TOK_BOOL             {$$ = TypePrimary::getBool();}
+    | TOK_BYTE             {$$ = TypePrimary::getByte();}
+    | TOK_SHORT            {$$ = TypePrimary::getShort();}
+    | TOK_INT              {$$ = TypePrimary::getInt();}
+    | TOK_LONG             {$$ = TypePrimary::getLong();}
+    | TOK_FLOAT            {$$ = TypePrimary::getFloat();}
+    | TOK_DOUBLE           {$$ = TypePrimary::getDouble();}
+    ;
+
+expr_primary
+    : TOK_TRUE                        {$$ = new ExprLiteral((bool)true);}
+    | TOK_FALSE                       {$$ = new ExprLiteral((bool)false);}
+    | allocate_array                  {$$ = $1;}
+    | literal_array                   {$$ = $1;}
+    | LITERAL_CHAR                    {$$ = new ExprLiteral((char)$1[1]);}
+    | LITERAL_BYTE                    {$$ = new ExprLiteral((char)atoi($1));}
+    | LITERAL_SHORT                   {$$ = new ExprLiteral((short)atoi($1));}
+    | LITERAL_INTEGER                 {$$ = new ExprLiteral((int)atoi($1));}
+    | LITERAL_LONG                    {$$ = new ExprLiteral((long)atoi($1));}
+    | LITERAL_FLOAT                   {$$ = new ExprLiteral((float)atof($1));}
+    | LITERAL_DOUBLE                  {$$ = new ExprLiteral(atof($1));}
+    | LITERAL_STRING                  {$$ = new ExprArray($1);}
+    | TOK_IDENTIFIER                  {$$ = new ExprSymbol($1);}
+    | TOK_TYPE_IDENTIFIER '(' ')'     {$$ = new ExprObject(new TypeClass(class_container[$1]));}
+    | '(' expression ')'              {$$ = $2;}
+    ;
+
+allocate_array
+    :   '{' type_specifier '*' expression '}'   {$$ = new ExprArray($2, $4);}
+    ;
+
+literal_array
+    : '{' array_list '}'                {$$ = $2;}
+    ;
+
+array_list
+    : expression                        {$$ = new ExprArray(); $$->addExpr($1);}
+    | array_list ',' expression         {$1->addExpr($3); $$ = $1;}
+    ;
+
+argument_list
+    : expression                        {$$ = new ExprCall(); $$->addArg($1);}
+    | argument_list ',' expression      {$$->addArg($3);}
+    ;
+    
+expr_postfix
+    : expr_primary
+    | expr_postfix '[' expression ']'         {$$ = new ExprOP2(ExprOP2::ARRAY, $1, $3);}
+    | expr_postfix '(' argument_list ')'      {$3->setCallee($1); $$ = $3;}
+    | expr_postfix '(' ')'                    {ExprCall* n = new ExprCall(); n->setCallee($1); $$ = n;}
+    | expr_postfix '.' TOK_IDENTIFIER         {$$ = new ExprOP2(ExprOP2::DOT, $1, new ExprSymbol($3));}
+    | TOK_TYPE_IDENTIFIER '.' TOK_IDENTIFIER  {$$ = new ExprOP2(ExprOP2::DOT, new ExprClass(class_container[$1]), new ExprSymbol($3));}
+    | expr_postfix TOK_INC                    {$$ = new ExprAssign($1, true, false);}
+    | expr_postfix TOK_DEC                    {$$ = new ExprAssign($1, true, true);}
+    ;
+    
+expr_unary
+    : expr_postfix
+    | TOK_INC expr_unary   {$$ = new ExprAssign($2, false, false);}
+    | TOK_DEC expr_unary   {$$ = new ExprAssign($2, false, true);}
+    | '+'     expr_unary   {$$ = new ExprOP1(ExprOP1::POS, $2);}
+    | '-'     expr_unary   {$$ = new ExprOP1(ExprOP1::NEG, $2);}
+    | '~'     expr_unary   {$$ = new ExprOP1(ExprOP1::B_NOT, $2);}
+    | '!'     expr_unary   {$$ = new ExprOP1(ExprOP1::NOT, $2);}
+    ;
+
+expr_mul
+    : expr_unary
+    | expr_mul '*' expr_unary   {$$ = new ExprOP2(ExprOP2::MUL, $1, $3);}
+    | expr_mul '/' expr_unary   {$$ = new ExprOP2(ExprOP2::DIV, $1, $3);}
+    | expr_mul '%' expr_unary   {$$ = new ExprOP2(ExprOP2::MOD, $1, $3);}
+    ;
+
+expr_add
+    : expr_mul
+    | expr_add '+' expr_mul   {$$ = new ExprOP2(ExprOP2::ADD, $1, $3);}
+    | expr_add '-' expr_mul   {$$ = new ExprOP2(ExprOP2::SUB, $1, $3);}
+    ;
+
+expr_shift
+    : expr_add
+    | expr_shift TOK_SHL  expr_add   {$$ = new ExprOP2(ExprOP2::SHL, $1, $3);}
+    | expr_shift TOK_SHR  expr_add   {$$ = new ExprOP2(ExprOP2::SHR, $1, $3);}
+    | expr_shift TOK_ASHR expr_add   {$$ = new ExprOP2(ExprOP2::ASHR, $1, $3);}
+    ;
+    
+expr_comparison
+    : expr_shift
+    | expr_comparison TOK_LT  expr_shift   {$$ = new ExprOP2(ExprOP2::LT, $1, $3);}
+    | expr_comparison TOK_LTE expr_shift   {$$ = new ExprOP2(ExprOP2::LTE, $1, $3);}
+    | expr_comparison TOK_GT  expr_shift   {$$ = new ExprOP2(ExprOP2::GT, $1, $3);}
+    | expr_comparison TOK_GTE expr_shift   {$$ = new ExprOP2(ExprOP2::GTE, $1, $3);}
+    ;
+    
+expr_equal
+    : expr_comparison
+    | expr_equal TOK_EQ  expr_comparison   {$$ = new ExprOP2(ExprOP2::EQ, $1, $3);}
+    | expr_equal TOK_NEQ expr_comparison   {$$ = new ExprOP2(ExprOP2::NEQ, $1, $3);}
+    ;
+    
+expr_bitwise_and
+    : expr_equal
+    | expr_bitwise_and '&' expr_equal      {$$ = new ExprOP2(ExprOP2::B_AND, $1, $3);}
+    ;
+    
+expr_bitwise_xor
+    : expr_bitwise_and
+    | expr_bitwise_xor '^' expr_bitwise_and   {$$ = new ExprOP2(ExprOP2::B_XOR, $1, $3);}
+    ;
+    
+expr_bitwise_or
+    : expr_bitwise_xor
+    | expr_bitwise_or '|' expr_bitwise_xor   {$$ = new ExprOP2(ExprOP2::B_OR, $1, $3);}
+    ;
+    
+expr_logical_and
+    : expr_bitwise_or
+    | expr_logical_and TOK_AND expr_bitwise_or   {$$ = new ExprOP2(ExprOP2::AND, $1, $3);}
+    ;
+    
+expr_logical_or
+    : expr_logical_and
+    | expr_logical_or TOK_OR expr_logical_and   {$$ = new ExprOP2(ExprOP2::OR, $1, $3);}
+    ;
+    
+expr_conditional
+    : expr_logical_or
+    | expr_logical_or '?' expression ':' expr_conditional   {$$ = new ExprCondition($1, $3, $5);}
+    ;
+    
+expr_assign
+    : expr_conditional
+    | expr_unary TOK_ASSIGN       expr_assign   {$$ = new ExprAssign($1, $3);}
+    | expr_unary TOK_ADD_ASSIGN   expr_assign   {$$ = new ExprAssign(ExprOP2::ADD , $1, $3);}
+    | expr_unary TOK_SUB_ASSIGN   expr_assign   {$$ = new ExprAssign(ExprOP2::SUB , $1, $3);}
+    | expr_unary TOK_MUL_ASSIGN   expr_assign   {$$ = new ExprAssign(ExprOP2::MUL , $1, $3);}
+    | expr_unary TOK_DIV_ASSIGN   expr_assign   {$$ = new ExprAssign(ExprOP2::DIV , $1, $3);}
+    | expr_unary TOK_MOD_ASSIGN   expr_assign   {$$ = new ExprAssign(ExprOP2::MOD , $1, $3);}
+    | expr_unary TOK_B_AND_ASSIGN expr_assign   {$$ = new ExprAssign(ExprOP2::B_AND , $1, $3);}
+    | expr_unary TOK_B_OR_ASSIGN  expr_assign   {$$ = new ExprAssign(ExprOP2::B_OR , $1, $3);}
+    | expr_unary TOK_B_XOR_ASSIGN expr_assign   {$$ = new ExprAssign(ExprOP2::B_XOR , $1, $3);}
+    | expr_unary TOK_SHL_ASSIGN   expr_assign   {$$ = new ExprAssign(ExprOP2::SHL , $1, $3);}
+    | expr_unary TOK_SHR_ASSIGN   expr_assign   {$$ = new ExprAssign(ExprOP2::SHR , $1, $3);}
+    | expr_unary TOK_ASHR_ASSIGN  expr_assign   {$$ = new ExprAssign(ExprOP2::ASHR , $1, $3);}
+    ;
+    
+expression
+    : expr_assign
+    ;
+
+%%
+#include "gc.h"
+
+void* cy_malloc2(size_t len) {
+    void* l;
+    l = GC_malloc(len);
+    //l = malloc(len);
+    std::cout << "Allocate: " << len << " @ " << l;
+    std::cout << " (";
+    for (size_t i = 0; i < len && i < 20; i++)
+    {
+        std::cout << ((char*)l)[len+i];
+    }
+    std::cout << ")" << std::endl;
+
+    return l;
+}
+
+void* cy_malloc(size_t len) {
+    void* l;
+    l = GC_malloc(len);
+    return l;
+}
+
+int main(int argc, char** argv)
+{
+    // Initialize include path
+    include_path = new std::vector<std::string>();
+    //include_path->push_back("./");
+    include_path->push_back("./cylib/");
+
+    included = new std::set<std::string>();
+
+    // Initialize GC
+    GC_INIT();
+
+    // Initialise option flags
+    bool only_file_name = false;
+
+    bool verify = false;
+    bool execute = false;
+    bool print_ast = false;
+    bool show_assembly = false;
+    bool dump_to_file = false;
+    bool optimize = false;
+    bool dump_classes = false;
+    file_to_parse = stdin;
+
+
+    for (int i = 1; i < argc; i++)
+    {
+        if (only_file_name || argv[i][0] != '-')
+        {
+            file_to_parse = fopen(argv[i], "r");
+        }
+        else
+        {
+            if (!strcmp(argv[i], "--"))
+            {
+                only_file_name = true;
+            }
+            else
+            {
+                for (size_t l = 1; l < strlen(argv[i]); l++)
+                {
+                    switch (argv[i][l])
+                    {
+                        case 'v':
+                            verify = true;
+                            break;
+                        case 'e':
+                            execute = true;
+                            break;
+                        case 't':
+                            print_ast = true;
+                            break;
+                        case 'a':
+                            show_assembly = true;
+                            break;
+                        case 'o':
+                            dump_to_file = true;
+                            break;
+                        case 'O':
+                            optimize = true;
+                            break;
+                        case 'c':
+                            dump_classes = true;
+                            break;
+                        default:
+                            printf("Unknown simple option: %c\n", argv[i][l]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Define the file to parse
+    set_file_to_parse(file_to_parse);
+
+    // Initialize main blocks
+    main_block = new StmBlock();
+    main_func = new StmDecl(TypePrimary::getVoid(), "__main__", 0, main_block);
+
+    // Initialize visitors
+    display_visitor = new VisitorNodeDisplay();
+    typer_visitor = new VisitorNodeTyper();
+    llvm_visitor = new VisitorNodeLlvm();
+    simplify_visitor = new VisitorNodeSimplify();
+    llvm_visitor->verify = verify;
+
+    // Initialize symbol table
+    Symtab* symt = new Symtab();
+    display_visitor->setSymtab(symt);
+    typer_visitor->setSymtab(symt);
+
+    // Initialize logger
+    out_debug = fopen("/dev/null", "rw");
+    //out_debug = stderr;
+
+    // Parser
+    try
+    {
+        yyparse();
+    }
+    catch (std::string s)
+    {
+        std::cout << s << std::endl;
+    }
+    catch (const char* s)
+    {
+        std::cout << s << std::endl;
+    }
+
+    // Add terminal instruction to main function
+    main_block->addStatement(new StmReturn(0));
+
+    try
+    {
+        main_func->accept(*typer_visitor);
+        if (print_ast)
+            main_func->accept(*display_visitor);
+        main_func->accept(*simplify_visitor);
+        main_func->accept(*llvm_visitor);
+    }
+    catch (std::string s)
+    {
+        std::cout << s << std::endl;
+        exit(1);
+    }
+    catch (const char* s)
+    {
+        std::cout << s << std::endl;
+        exit(1);
+    }
+
+    // Dump llvm assembly
+    if (show_assembly)
+        llvm_visitor->getModule()->dump();
+
+    // Dump llvm assembly to file
+    if (dump_to_file)
+    {
+        std::ofstream fp;
+        fp.open("out.ss");
+        llvm::raw_os_ostream ros(fp);
+        llvm_visitor->getModule()->print(ros, 0);
+    }
+
+    if (verify)
+    {
+        llvm::verifyFunction(*llvm_visitor->module->getFunction("__main__"));
+    }
+
+    // Execute __main__ function
+    if (execute)
+    {
+        // Initialize LLVM JIT
+        llvm::InitializeNativeTarget();
+
+        // Create LLVM Execution Engine
+        std::string ErrStr;
+        llvm_visitor->exec = llvm::EngineBuilder(llvm_visitor->module).setErrorStr(&ErrStr).create();
+        // FIXME
+        if (!llvm_visitor->exec) {
+            fprintf(stderr, "Could not create ExecutionEngine: %s\n", ErrStr.c_str());
+            exit(1);
+        }
+
+        if (optimize) {
+            llvm_visitor->optimize();
+        }
+
+        // bind runtime functions
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("cy_malloc"), (void*)cy_malloc);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("cy_malloc2"), (void*)cy_malloc2);
+
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("putbyte"),   (void*)putbyte);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("putshort"),  (void*)putshort);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("putint"),    (void*)putint);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("putlong"),   (void*)putlong);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("putfloat"),  (void*)putfloat);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("putdouble"), (void*)putdouble);
+
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("btos"), (void*)btos);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("btoi"), (void*)btoi);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("btol"), (void*)btol);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("stob"), (void*)stob);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("stoi"), (void*)stoi);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("stol"), (void*)stol);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("itob"), (void*)itob);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("itos"), (void*)itos);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("itol"), (void*)itol);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("ltob"), (void*)ltob);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("ltos"), (void*)ltos);
+        llvm_visitor->exec->addGlobalMapping(llvm_visitor->module->getFunction("ltoi"), (void*)ltoi);
+
+        // Get pointer to main function
+        void (*main_func)() = (void (*)())(intptr_t)llvm_visitor->exec->getPointerToFunction(llvm_visitor->module->getFunction("__main__"));;
+
+        // Execute main func
+        main_func();
+    }
+
+    // Show classes
+    if (dump_classes)
+    {
+        std::map<std::string, Class*>::iterator it;
+        for (it = class_container.begin(); it != class_container.end(); it++)
+        {
+            std::cout << it->first << ": " << it->second->getName() << std::endl;
+        }
+    }
+    return 0;
+}

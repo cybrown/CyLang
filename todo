@@ -1,0 +1,25 @@
+
+TODO NODES:
+
+Statements:
+
+=done:
+expression
+if
+while
+do
+for
+nop
+block
+return
+declaration
+
+=to implement soon
+switch
+
+=to implement later
+asm
+try
+
+
+GENERAL

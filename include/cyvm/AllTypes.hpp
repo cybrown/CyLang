@@ -1,0 +1,5 @@
+#include "Type.hpp"
+#include "TypeArray.hpp"
+#include "TypeClass.hpp"
+#include "TypeFunction.hpp"
+#include "TypePrimary.hpp"
